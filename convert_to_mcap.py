@@ -18,11 +18,20 @@ from pypcd import pypcd
 from pyquaternion import Quaternion
 from tqdm import tqdm
 
-
+from foxglove.CameraCalibration_pb2 import CameraCalibration
+from foxglove.CompressedImage_pb2 import CompressedImage
+from foxglove.FrameTransform_pb2 import FrameTransform
 from foxglove.Grid_pb2 import Grid
+from foxglove.ImageAnnotations_pb2 import ImageAnnotations
+from foxglove.LinePrimitive_pb2 import LinePrimitive
+from foxglove.LocationFix_pb2 import LocationFix
 from foxglove.PackedElementField_pb2 import PackedElementField
-
-
+from foxglove.PointCloud_pb2 import PointCloud
+from foxglove.PoseInFrame_pb2 import PoseInFrame
+from foxglove.PointsAnnotation_pb2 import PointsAnnotation
+from foxglove.Quaternion_pb2 import Quaternion as foxglove_Quaternion
+from foxglove.SceneUpdate_pb2 import SceneUpdate
+from foxglove.Vector3_pb2 import Vector3
 from ProtobufWriter import ProtobufWriter
 from RosmsgWriter import RosmsgWriter
 
@@ -273,6 +282,46 @@ def get_scene_map(nusc, scene, nusc_map, image, stamp):
     return msg
 
 
+def rectContains(rect, point):
+    a, b, c, d = rect
+    x, y = point[:2]
+    return a <= x < a + c and b <= y < b + d
+
+
+def get_centerline_markers(nusc, scene, nusc_map, stamp):
+    pose_lists = nusc_map.discretize_centerlines(1)
+    bbox = scene_bounding_box(nusc, scene, nusc_map)
+
+    contained_pose_lists = []
+    for pose_list in pose_lists:
+        new_pose_list = []
+        for pose in pose_list:
+            if rectContains(bbox, pose):
+                new_pose_list.append(pose)
+        if len(new_pose_list) > 1:
+            contained_pose_lists.append(new_pose_list)
+
+    scene_update = SceneUpdate()
+    for i, pose_list in enumerate(contained_pose_lists):
+        entity = scene_update.entities.add()
+        entity.frame_id = "map"
+        entity.timestamp.FromNanoseconds(stamp.to_nsec())
+        entity.id = f"{i}"
+        entity.frame_locked = True
+        line = entity.lines.add()
+        line.type = LinePrimitive.Type.LINE_STRIP
+        line.thickness = 0.1
+        line.color.r = 51.0 / 255.0
+        line.color.g = 160.0 / 255.0
+        line.color.b = 44.0 / 255.0
+        line.color.a = 1.0
+        line.pose.orientation.w = 1.0
+        for pose in pose_list:
+            line.points.add(x=pose[0], y=pose[1], z=0)
+
+    return scene_update 
+
+
 def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepath):
     scene_name = scene["name"]
     log = nusc.get("log", scene["log_token"])
@@ -347,6 +396,7 @@ def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepat
             )
         )
         map_msg = get_scene_map(nusc, scene, nusc_map, image, stamp)
+        centerlines_msg = get_centerline_markers(nusc, scene, nusc_map, stamp)
         
         
         
