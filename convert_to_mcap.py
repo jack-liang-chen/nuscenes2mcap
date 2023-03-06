@@ -19,6 +19,94 @@ from pyquaternion import Quaternion
 from tqdm import tqdm
 
 
+from ProtobufWriter import ProtobufWriter
+from RosmsgWriter import RosmsgWriter
+
+with open(Path(__file__).parent / "turbomap.json") as f:
+    TURBOMAP_DATA = np.array(json.load(f))
+
+
+# https://github.com/nutonomy/nuscenes-devkit/blob/master/python-sdk/nuscenes/can_bus/README.md#imu
+IMU_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "linear_accel": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "z": {"type": "number"},
+            },
+        },
+        "q": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "z": {"type": "number"},
+                "w": {"type": "number"},
+            },
+        },
+        "rotation_rate": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "z": {"type": "number"},
+            },
+        },
+    },
+}
+
+# https://github.com/nutonomy/nuscenes-devkit/blob/master/python-sdk/nuscenes/can_bus/README.md#pose
+ODOM_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "accel": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "z": {"type": "number"},
+            },
+        },
+        "orientation": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "z": {"type": "number"},
+                "w": {"type": "number"},
+            },
+        },
+        "pos": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "z": {"type": "number"},
+            },
+        },
+        "rotation_rate": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "z": {"type": "number"},
+            },
+        },
+        "vel": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "z": {"type": "number"},
+            },
+        },
+    },
+}
+
+
 def load_bitmap(dataroot: str, map_name: str, layer_name: str) -> np.array:
     # Load bitmap.
     if layer_name == "basemap":
@@ -174,6 +262,21 @@ def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepat
         print(f"Writing to {filepath}")
         writer = Writer(fp, compression=CompressionType.LZ4)
 
+        imu_schema_id = writer.register_schema(name="IMU", encoding="jsonschema", data=json.dumps(IMU_JSON_SCHEMA).encode())
+        imu_channel_id = writer.register_channel(topic="/imu", message_encoding="json", schema_id=imu_schema_id)
+
+        odom_schema_id = writer.register_schema(name="Pose", encoding="jsonschema", data=json.dumps(ODOM_JSON_SCHEMA).encode())
+        odom_channel_id = writer.register_channel(topic="/odom", message_encoding="json", schema_id=odom_schema_id)
+
+        protobuf_writer = ProtobufWriter(writer)
+        rosmsg_writer = RosmsgWriter(writer)
+        writer.start(profile="", library="nuscenes2mcap")
+        
+        
+        
+        
+        
+        
         
         while cur_sample is not None:
             sample_lidar = nusc.get("sample_data", cur_sample["data"]["LIDAR_TOP"])
