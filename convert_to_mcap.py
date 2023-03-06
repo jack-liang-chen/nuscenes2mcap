@@ -19,6 +19,10 @@ from pyquaternion import Quaternion
 from tqdm import tqdm
 
 
+from foxglove.Grid_pb2 import Grid
+from foxglove.PackedElementField_pb2 import PackedElementField
+
+
 from ProtobufWriter import ProtobufWriter
 from RosmsgWriter import RosmsgWriter
 
@@ -216,6 +220,59 @@ def get_basic_can_msg(name, diag_data):
     pass    
  
 
+def scene_bounding_box(nusc, scene, nusc_map, padding=75.0):
+    box = [np.inf, np.inf, -np.inf, -np.inf]
+    cur_sample = nusc.get("sample", scene["first_sample_token"])
+    while cur_sample is not None:
+        sample_lidar = nusc.get("sample_data", cur_sample["data"]["LIDAR_TOP"])
+        ego_pose = nusc.get("ego_pose", sample_lidar["ego_pose_token"])
+        x, y = ego_pose["translation"][:2]
+        box[0] = min(box[0], x)
+        box[1] = min(box[1], y)
+        box[2] = max(box[2], x)
+        box[3] = max(box[3], y)
+        cur_sample = nusc.get("sample", cur_sample["next"]) if cur_sample.get("next") != "" else None
+    box[0] = max(box[0] - padding, 0.0)
+    box[1] = max(box[1] - padding, 0.0)
+    box[2] = min(box[2] + padding, nusc_map.canvas_edge[0]) - box[0]
+    box[3] = min(box[3] + padding, nusc_map.canvas_edge[1]) - box[1]
+    return box
+    
+
+def get_scene_map(nusc, scene, nusc_map, image, stamp):
+    x, y, w, h = scene_bounding_box(nusc, scene, nusc_map)
+    img_x = int(x * 10)
+    img_y = int(y * 10)
+    img_w = int(w * 10)
+    img_h = int(h * 10)
+    img = np.flipud(image)[img_y : img_y + img_h, img_x : img_x + img_w]
+    
+    # img values are 0-255
+    # convert to a color scale, 0=white and 255=black, in packed RGBA format: 0xFFFFFF00 to 0x00000000
+    img = (255 - img) * 0x01010100
+    # set alpha to 0xFF for all cells except those that are completely black
+    img[img != 0x00000000] |= 0x000000FF
+
+    msg = Grid()
+    msg.timestamp.FromNanoseconds(stamp.to_nsec())
+    msg.frame_id = "map"
+    msg.cell_size.x = 0.1
+    msg.cell_size.y = 0.1
+    msg.column_count = img_w
+    msg.row_stride = img_w * 4
+    msg.cell_stride = 4
+    msg.fields.add(name="alpha", offset=0, type=PackedElementField.UINT8)
+    msg.fields.add(name="blue", offset=1, type=PackedElementField.UINT8)
+    msg.fields.add(name="green", offset=2, type=PackedElementField.UINT8)
+    msg.fields.add(name="red", offset=3, type=PackedElementField.UINT8)
+    msg.pose.position.x = x
+    msg.pose.position.y = y
+    msg.pose.orientation.w = 1
+    msg.data = img.astype("<u4").tobytes()
+
+    return msg
+
+
 def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepath):
     scene_name = scene["name"]
     log = nusc.get("log", scene["log_token"])
@@ -256,7 +313,7 @@ def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepat
         ],
     ]
     
-    filepath.parent.mkdir(parent=True, exist_ok=True)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
     
     with open(filepath, "wb") as fp:
         print(f"Writing to {filepath}")
@@ -272,9 +329,24 @@ def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepat
         rosmsg_writer = RosmsgWriter(writer)
         writer.start(profile="", library="nuscenes2mcap")
         
+        writer.add_metadata(
+            "scene-info",
+            {
+                "description": scene["description"],
+                "name": scene["name"],
+                "location": location,
+                "vehicle": log["vehicle"],
+                "date_captured": log["date_captured"],
+            },
+        )
         
-        
-        
+        stamp = get_time(
+            nusc.get(
+                "ego_pose",
+                nusc.get("sample_data", cur_sample["data"]["LIDAR_TOP"])["ego_pose_token"],
+            )
+        )
+        map_msg = get_scene_map(nusc, scene, nusc_map, image, stamp)
         
         
         
