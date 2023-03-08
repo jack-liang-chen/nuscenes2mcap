@@ -322,6 +322,140 @@ def get_centerline_markers(nusc, scene, nusc_map, stamp):
     return scene_update 
 
 
+def get_translation(data):
+    return Vector3(x=data["translation"][0], y=data["translation"][1], z=data["translation"][2])
+
+
+def get_rotation(data):
+    return foxglove_Quaternion(x=data["rotation"][1], y=data["rotation"][2], z=data["rotation"][3], w=data["rotation"][0])
+
+
+def get_ego_tf(ego_pose):
+    ego_tf = FrameTransform()
+    ego_tf.parent_frame_id = "map"
+    ego_tf.timestamp.FromMicroseconds(ego_pose["timestamp"])
+    ego_tf.child_frame_id = "base_link"
+    ego_tf.translation.CopyFrom(get_translation(ego_pose))
+    ego_tf.rotation.CopyFrom(get_rotation(ego_pose))
+    return ego_tf
+
+
+def write_drivable_area(protobuf_writer, nusc_map, ego_pose, stamp):
+    translation = ego_pose["translation"]
+    rotation = Quaternion(ego_pose["rotation"])
+    yaw_radians = quaternion_yaw(rotation)
+    yaw_degrees = yaw_radians / np.pi * 180
+    patch_box = (translation[0], translation[1], 32, 32)
+    canvas_size = (patch_box[2] * 10, patch_box[3] * 10)
+
+    drivable_area = nusc_map.get_map_mask(patch_box, yaw_degrees, ["drivable_area"], canvas_size)[0]
+
+    msg = Grid()
+    msg.timestamp.FromNanoseconds(stamp.to_nsec())
+    msg.frame_id = "map"
+    msg.cell_size.x = 0.1
+    msg.cell_size.y = 0.1
+    msg.column_count = drivable_area.shape[1]
+    msg.row_stride = drivable_area.shape[1]
+    msg.cell_stride = 1
+    msg.fields.add(name="drivable_area", offset=0, type=PackedElementField.UINT8)
+    msg.pose.position.x = translation[0] - (16 * math.cos(yaw_radians)) + (16 * math.sin(yaw_radians))
+    msg.pose.position.y = translation[1] - (16 * math.sin(yaw_radians)) - (16 * math.cos(yaw_radians))
+    msg.pose.position.z = 0.01  # Drivable area sits 1cm above the map
+    q = Quaternion(axis=(0, 0, 1), radians=yaw_radians)
+    msg.pose.orientation.x = q.x
+    msg.pose.orientation.y = q.y
+    msg.pose.orientation.z = q.z
+    msg.pose.orientation.w = q.w
+    msg.data = drivable_area.astype(np.uint8).tobytes()
+
+    protobuf_writer.write_message("/drivable_area", msg, stamp.to_nsec())
+
+
+def get_sensor_tf(nusc, sensor_id, sample_data):
+    sensor_tf = FrameTransform()
+    sensor_tf.parent_frame_id = "base_link"
+    sensor_tf.timestamp.FromMicroseconds(sample_data["timestamp"])
+    sensor_tf.child_frame_id = sensor_id
+    calibrated_sensor = nusc.get("calibrated_sensor", sample_data["calibrated_sensor_token"])
+    sensor_tf.translation.CopyFrom(get_translation(calibrated_sensor))
+    sensor_tf.rotation.CopyFrom(get_rotation(calibrated_sensor))
+    return sensor_tf
+
+
+PCD_TO_PACKED_ELEMENT_TYPE_MAP = {
+    ("I", 1): PackedElementField.INT8,
+    ("U", 1): PackedElementField.UINT8,
+    ("I", 2): PackedElementField.INT16,
+    ("U", 2): PackedElementField.UINT16,
+    ("I", 4): PackedElementField.INT32,
+    ("U", 4): PackedElementField.UINT32,
+    ("F", 4): PackedElementField.FLOAT32,
+    ("F", 8): PackedElementField.FLOAT64,
+}
+
+
+def get_radar(data_path, sample_data, frame_id) -> PointCloud:
+    pc_filename = data_path / sample_data["filename"]
+    pc = pypcd.PointCloud.from_path(pc_filename)
+    msg = PointCloud()
+    msg.frame_id = frame_id
+    msg.timestamp.FromMicroseconds(sample_data["timestamp"])
+    offset = 0
+    for name, size, count, ty in zip(pc.fields, pc.size, pc.count, pc.type):
+        assert count == 1
+        msg.fields.add(name=name, offset=offset, type=PCD_TO_PACKED_ELEMENT_TYPE_MAP[(ty, size)])
+        offset += size
+
+    msg.point_stride = offset
+    msg.data = pc.pc_data.tobytes()
+    return msg
+
+
+def get_lidar(data_path, sample_data, frame_id) -> PointCloud:
+    pc_filename = data_path / sample_data["filename"]
+
+    with open(pc_filename, "rb") as pc_file:
+        msg = PointCloud()
+        msg.frame_id = frame_id
+        msg.timestamp.FromMicroseconds(sample_data["timestamp"])
+        msg.fields.add(name="x", offset=0, type=PackedElementField.FLOAT32),
+        msg.fields.add(name="y", offset=4, type=PackedElementField.FLOAT32),
+        msg.fields.add(name="z", offset=8, type=PackedElementField.FLOAT32),
+        msg.fields.add(name="intensity", offset=12, type=PackedElementField.FLOAT32),
+        msg.fields.add(name="ring", offset=16, type=PackedElementField.FLOAT32),
+        msg.point_stride = len(msg.fields) * 4  # 4 bytes per field
+        msg.data = pc_file.read()
+        return msg
+
+    
+def get_camera(data_path, sample_data, frame_id):
+    jpg_filename = data_path / sample_data["filename"]
+    msg = CompressedImage()
+    msg.timestamp.FromMicroseconds(sample_data["timestamp"])
+    msg.frame_id = frame_id
+    msg.format = "jpeg"
+    with open(jpg_filename, "rb") as jpg_file:
+        msg.data = jpg_file.read()
+    return msg
+
+
+def get_camera_info(nusc, sample_data, frame_id):
+    calib = nusc.get("calibrated_sensor", sample_data["calibrated_sensor_token"])
+
+    msg_info = CameraCalibration()
+    msg_info.timestamp.FromMicroseconds(sample_data["timestamp"])
+    msg_info.frame_id = frame_id
+    msg_info.height = sample_data["height"]
+    msg_info.width = sample_data["width"]
+    msg_info.K[:] = (calib["camera_intrinsic"][r][c] for r in range(3) for c in range(3))
+    msg_info.R[:] = [1, 0, 0, 0, 1, 0, 0, 0, 1]
+    msg_info.P[:] = [msg_info.K[0], msg_info.K[1], msg_info.K[2], 0, msg_info.K[3], msg_info.K[4], msg_info.K[5], 0, 0, 0, 1, 0]
+    return msg_info
+
+
+
+
 def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepath):
     scene_name = scene["name"]
     log = nusc.get("log", scene["log_token"])
@@ -400,20 +534,63 @@ def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepat
         protobuf_writer.write_message("/map", map_msg, stamp.to_nsec())
         protobuf_writer.write_message("/semantic_map", centerlines_msg, stamp.to_nsec())
         
-        
-        
         while cur_sample is not None:
             sample_lidar = nusc.get("sample_data", cur_sample["data"]["LIDAR_TOP"])
             ego_pose = nusc.get("ego_pose", sample_lidar["ego_pose_token"])
             stamp = get_time(ego_pose)
             
             # write CAN message to /pose, /odom, and /diagnostics
-            
+            can_msg_events = []
+            for i in range(len(can_parsers)):
+                (can_msgs, index, msg_func) = can_parsers[i]
+                while index < len(can_msgs) and get_utime(can_msgs[index]) < stamp:
+                    can_msg_events.append(msg_func(can_msgs[index]))
+                    index += 1
+                    can_parsers[i][1] = index
+            can_msg_events.sort(key=lambda x: x[0])
+            for (msg_stamp, topic, msg) in can_msg_events:
+                if topic == "/imu":
+                    writer.add_message(imu_channel_id, msg_stamp.to_nsec(), msg, msg_stamp.to_nsec())
+                elif topic == "/odom":
+                    writer.add_message(odom_channel_id, msg_stamp.to_nsec(), msg, msg_stamp.to_nsec())
+                else:
+                    rosmsg_writer.write_message(topic, msg, msg_stamp)
+
             # publish /tf
+            protobuf_writer.write_message("/tf", get_ego_tf(ego_pose), stamp.to_nsec())
             
             # /driveable_area occupancy grid
+            write_drivable_area(protobuf_writer, nusc_map, ego_pose, stamp)
             
             # iterate sensors
+            for (sensor_id, sample_token) in cur_sample["data"].items():
+                pbar.update(1)
+                sample_data = nusc.get("sample_data", sample_token)
+                topic = "/" + sensor_id
+
+                # create sensor transform
+                protobuf_writer.write_message("/tf", get_sensor_tf(nusc, sensor_id, sample_data), stamp.to_nsec())
+
+                # write the sensor data
+                if sample_data["sensor_modality"] == "radar":
+                    msg = get_radar(data_path, sample_data, sensor_id)
+                    protobuf_writer.write_message(topic, msg, stamp.to_nsec())
+                elif sample_data["sensor_modality"] == "lidar":
+                    msg = get_lidar(data_path, sample_data, sensor_id)
+                    protobuf_writer.write_message(topic, msg, stamp.to_nsec())
+                elif sample_data["sensor_modality"] == "camera":
+                    msg = get_camera(data_path, sample_data, sensor_id)
+                    protobuf_writer.write_message(topic + "/image_rect_compressed", msg, stamp.to_nsec())
+                    msg = get_camera_info(nusc, sample_data, sensor_id)
+                    protobuf_writer.write_message(topic + "/camera_info", msg, stamp.to_nsec())
+
+
+
+
+
+            # publish /pose
+
+
             
             # publish /gps
             
@@ -425,7 +602,9 @@ def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepat
             
             # sort and publish the non-keyframe sensor msgs
             
+            
             # move to the next sample
+            cur_sample = nusc.get("sample", cur_sample["next"]) if cur_sample.get("next") != "" else None
         
         pbar.close()
         writer.finish()
