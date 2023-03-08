@@ -397,6 +397,8 @@ def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepat
         )
         map_msg = get_scene_map(nusc, scene, nusc_map, image, stamp)
         centerlines_msg = get_centerline_markers(nusc, scene, nusc_map, stamp)
+        protobuf_writer.write_message("/map", map_msg, stamp.to_nsec())
+        protobuf_writer.write_message("/semantic_map", centerlines_msg, stamp.to_nsec())
         
         
         
