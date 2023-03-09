@@ -454,6 +454,165 @@ def get_camera_info(nusc, sample_data, frame_id):
     return msg_info
 
 
+def turbomap(x):
+    np.clip(x, 0, 1, out=x)
+    x *= 255
+    a = x.astype(np.uint8)
+    x -= a  # compute "f" in place
+    b = np.minimum(254, a)
+    b += 1
+    color_a = TURBOMAP_DATA[a]
+    color_b = TURBOMAP_DATA[b]
+    color_b -= color_a
+    color_b *= x[:, np.newaxis]
+    return np.add(color_a, color_b, out=color_b)
+
+
+def get_lidar_image_annotations(nusc, sample_lidar, sample_data, frame_id):
+    # lidar image markers in camera frame
+    points, coloring, _ = nusc.explorer.map_pointcloud_to_image(
+        pointsensor_token=sample_lidar["token"],
+        camera_token=sample_data["token"],
+        render_intensity=True,
+    )
+    points = points.transpose()
+
+    msg = ImageAnnotations()
+    ann = msg.points.add()
+    ann.timestamp.FromMicroseconds(sample_data["timestamp"])
+    ann.type = PointsAnnotation.Type.POINTS
+    ann.thickness = 2
+    for p in points:
+        ann.points.add(x=p[0], y=p[1])
+    for c in turbomap(coloring):
+        ann.outline_colors.add(r=c[0], g=c[1], b=c[2], a=1)
+    return msg
+
+
+class Collector:
+    """
+    Emulates the Matplotlib Axes class to collect line data.
+    """
+
+    def __init__(self):
+        self.points = []
+        self.colors = []
+
+    def plot(self, xx, yy, color, linewidth):
+        x1, x2 = xx
+        y1, y2 = yy
+        self.points.append((x1, y1))
+        self.points.append((x2, y2))
+        self.colors.append(color)
+
+
+def write_boxes_image_annotations(nusc, protobuf_writer, anns, sample_data, frame_id, topic_ns, stamp):
+    # annotation boxes
+    collector = Collector()
+    _, boxes, camera_intrinsic = nusc.get_sample_data(sample_data["token"])
+    for box in boxes:
+        c = np.array(nusc.explorer.get_color(box.name)) / 255.0
+        box.render(collector, view=camera_intrinsic, normalize=True, colors=(c, c, c))
+
+    msg = ImageAnnotations()
+
+    ann = msg.points.add()
+    ann.timestamp.FromMicroseconds(sample_data["timestamp"])
+    ann.type = PointsAnnotation.Type.LINE_LIST
+    ann.thickness = 2
+    for p in collector.points:
+        ann.points.add(x=p[0], y=p[1])
+    for c in collector.colors:
+        ann.outline_colors.add(r=c[0], g=c[1], b=c[2], a=1)
+
+    protobuf_writer.write_message(topic_ns + "/annotations", msg, ann.timestamp.ToNanoseconds())
+
+
+EARTH_RADIUS_METERS = 6.378137e6
+REFERENCE_COORDINATES = {
+    "boston-seaport": [42.336849169438615, -71.05785369873047],
+    "singapore-onenorth": [1.2882100868743724, 103.78475189208984],
+    "singapore-hollandvillage": [1.2993652317780957, 103.78217697143555],
+    "singapore-queenstown": [1.2782562240223188, 103.76741409301758],
+}
+
+
+def get_coordinate(ref_lat: float, ref_lon: float, bearing: float, dist: float) -> Tuple[float, float]:
+    """
+    Using a reference coordinate, extract the coordinates of another point in space given its distance and bearing
+    to the reference coordinate. For reference, please see: https://www.movable-type.co.uk/scripts/latlong.html.
+    :param ref_lat: Latitude of the reference coordinate in degrees, ie: 42.3368.
+    :param ref_lon: Longitude of the reference coordinate in degrees, ie: 71.0578.
+    :param bearing: The clockwise angle in radians between target point, reference point and the axis pointing north.
+    :param dist: The distance in meters from the reference point to the target point.
+    :return: A tuple of lat and lon.
+    """
+    lat, lon = math.radians(ref_lat), math.radians(ref_lon)
+    angular_distance = dist / EARTH_RADIUS_METERS
+
+    target_lat = math.asin(math.sin(lat) * math.cos(angular_distance) + math.cos(lat) * math.sin(angular_distance) * math.cos(bearing))
+    target_lon = lon + math.atan2(
+        math.sin(bearing) * math.sin(angular_distance) * math.cos(lat),
+        math.cos(angular_distance) - math.sin(lat) * math.sin(target_lat),
+    )
+    return math.degrees(target_lat), math.degrees(target_lon)
+
+
+def derive_latlon(location: str, pose: Dict[str, float]):
+    """
+    For each pose value, extract its respective lat/lon coordinate and timestamp.
+
+    This makes the following two assumptions in order to work:
+        1. The reference coordinate for each map is in the south-western corner.
+        2. The origin of the global poses is also in the south-western corner (and identical to 1).
+    :param location: The name of the map the poses correspond to, ie: 'boston-seaport'.
+    :param poses: All nuScenes egopose dictionaries of a scene.
+    :return: A list of dicts (lat/lon coordinates and timestamps) for each pose.
+    """
+    assert location in REFERENCE_COORDINATES.keys(), f"Error: The given location: {location}, has no available reference."
+
+    reference_lat, reference_lon = REFERENCE_COORDINATES[location]
+    x, y = pose["translation"][:2]
+    bearing = math.atan(x / y)
+    distance = math.sqrt(x**2 + y**2)
+    lat, lon = get_coordinate(reference_lat, reference_lon, bearing, distance)
+    return lat, lon
+
+
+def get_car_scene_update(stamp) -> SceneUpdate:
+    scene_update = SceneUpdate()
+    entity = scene_update.entities.add()
+    entity.frame_id = "base_link"
+    entity.timestamp.FromNanoseconds(stamp)
+    entity.id = "car"
+    entity.frame_locked = True
+    model = entity.models.add()
+    model.pose.position.x = 1
+    model.pose.orientation.w = 1
+    model.scale.x = 1
+    model.scale.y = 1
+    model.scale.z = 1
+    model.url = "https://assets.foxglove.dev/NuScenes_car_uncompressed.glb"
+    return scene_update
+
+
+def find_closest_lidar(nusc, lidar_start_token, stamp_nsec):
+    candidates = []
+
+    next_lidar_token = nusc.get("sample_data", lidar_start_token)["next"]
+    while next_lidar_token != "":
+        lidar_data = nusc.get("sample_data", next_lidar_token)
+        if lidar_data["is_key_frame"]:
+            break
+
+        dist_abs = abs(stamp_nsec - get_time(lidar_data).to_nsec())
+        candidates.append((dist_abs, lidar_data))
+        next_lidar_token = lidar_data["next"]
+
+    if len(candidates) == 0:
+        return None
+
+    return min(candidates, key=lambda x: x[0])[1]
 
 
 def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepath):
@@ -584,24 +743,121 @@ def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepat
                     msg = get_camera_info(nusc, sample_data, sensor_id)
                     protobuf_writer.write_message(topic + "/camera_info", msg, stamp.to_nsec())
 
-
-
-
+                if sample_data["sensor_modality"] == "camera":
+                    msg = get_lidar_image_annotations(nusc, sample_lidar, sample_data, sensor_id)
+                    protobuf_writer.write_message(topic + "/lidar", msg, stamp.to_nsec())
+                    write_boxes_image_annotations(
+                        nusc,
+                        protobuf_writer,
+                        cur_sample["anns"],
+                        sample_data,
+                        sensor_id,
+                        topic,
+                        stamp,
+                    )
 
             # publish /pose
-
-
+            pose_in_frame = PoseInFrame()
+            pose_in_frame.timestamp.FromNanoseconds(stamp.to_nsec())
+            pose_in_frame.frame_id = "base_link"
+            pose_in_frame.pose.orientation.w = 1
+            protobuf_writer.write_message("/pose", pose_in_frame, stamp.to_nsec())
             
             # publish /gps
+            lat, lon = derive_latlon(location, ego_pose)
+            gps = LocationFix()
+            gps.latitude = lat
+            gps.longitude = lon
+            gps.altitude = get_translation(ego_pose).z
+            protobuf_writer.write_message("/gps", gps, stamp.to_nsec())
             
             # publish /markers/annotations
-            
+            scene_update = SceneUpdate()
+            for annotation_id in cur_sample["anns"]:
+                ann = nusc.get("sample_annotation", annotation_id)
+                marker_id = ann["instance_token"][:4]
+                c = np.array(nusc.explorer.get_color(ann["category_name"])) / 255.0
+
+                entity = scene_update.entities.add()
+                entity.frame_id = "map"
+                entity.timestamp.FromNanoseconds(stamp.to_nsec())
+                entity.id = marker_id
+                entity.frame_locked = True
+                metadata = entity.metadata.add()
+                metadata.key = "category"
+                metadata.value = ann["category_name"]
+                cube = entity.cubes.add()
+                cube.pose.position.x = ann["translation"][0]
+                cube.pose.position.y = ann["translation"][1]
+                cube.pose.position.z = ann["translation"][2]
+                cube.pose.orientation.w = ann["rotation"][0]
+                cube.pose.orientation.x = ann["rotation"][1]
+                cube.pose.orientation.y = ann["rotation"][2]
+                cube.pose.orientation.z = ann["rotation"][3]
+                cube.size.x = ann["size"][1]
+                cube.size.y = ann["size"][0]
+                cube.size.z = ann["size"][2]
+                cube.color.r = c[0]
+                cube.color.g = c[1]
+                cube.color.b = c[2]
+                cube.color.a = 0.5
+            protobuf_writer.write_message("/markers/annotations", scene_update, stamp.to_nsec())
+
             # publish /markers/car
+            protobuf_writer.write_message("/markers/car", get_car_scene_update(stamp.to_nsec()), stamp.to_nsec())
             
             # collect all sensor frames after this sample but before the next sample
+            non_keyframe_sensor_msgs = []
+            for (sensor_id, sample_token) in cur_sample["data"].items():
+                topic = "/" + sensor_id
+
+                next_sample_token = nusc.get("sample_data", sample_token)["next"]
+                while next_sample_token != "":
+                    next_sample_data = nusc.get("sample_data", next_sample_token)
+                    # if next_sample_data['is_key_frame'] or get_time(next_sample_data).to_nsec() > next_stamp.to_nsec():
+                    #     break
+                    if next_sample_data["is_key_frame"]:
+                        break
+
+                    pbar.update(1)
+                    ego_pose = nusc.get("ego_pose", next_sample_data["ego_pose_token"])
+                    ego_tf = get_ego_tf(ego_pose)
+                    non_keyframe_sensor_msgs.append((ego_tf.timestamp.ToNanoseconds(), "/tf", ego_tf))
+
+                    if next_sample_data["sensor_modality"] == "radar":
+                        msg = get_radar(data_path, next_sample_data, sensor_id)
+                        non_keyframe_sensor_msgs.append((msg.timestamp.ToNanoseconds(), topic, msg))
+                    elif next_sample_data["sensor_modality"] == "lidar":
+                        msg = get_lidar(data_path, next_sample_data, sensor_id)
+                        non_keyframe_sensor_msgs.append((msg.timestamp.ToNanoseconds(), topic, msg))
+                    elif next_sample_data["sensor_modality"] == "camera":
+                        msg = get_camera(data_path, next_sample_data, sensor_id)
+                        camera_stamp_nsec = msg.timestamp.ToNanoseconds()
+                        non_keyframe_sensor_msgs.append((camera_stamp_nsec, topic + "/image_rect_compressed", msg))
+
+                        msg = get_camera_info(nusc, next_sample_data, sensor_id)
+                        non_keyframe_sensor_msgs.append((camera_stamp_nsec, topic + "/camera_info", msg))
+
+                        closest_lidar = find_closest_lidar(nusc, cur_sample["data"]["LIDAR_TOP"], camera_stamp_nsec)
+                        if closest_lidar is not None:
+                            msg = get_lidar_image_annotations(nusc, closest_lidar, next_sample_data, sensor_id)
+                            non_keyframe_sensor_msgs.append(
+                                (
+                                    msg.points[0].timestamp.ToNanoseconds(),
+                                    topic + "/lidar",
+                                    msg,
+                                )
+                            )
+
+                    next_sample_token = next_sample_data["next"]
             
             # sort and publish the non-keyframe sensor msgs
-            
+            non_keyframe_sensor_msgs.sort(key=lambda x: x[0])
+            for (timestamp, topic, msg) in non_keyframe_sensor_msgs:
+                if hasattr(msg, "header"):
+                    rosmsg_writer.write_message(topic, msg, msg.header.stamp)
+                else:
+                    protobuf_writer.write_message(topic, msg, timestamp)
             
             # move to the next sample
             cur_sample = nusc.get("sample", cur_sample["next"]) if cur_sample.get("next") != "" else None
