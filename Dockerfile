@@ -22,6 +22,8 @@ RUN pip3 install protobuf
 
 RUN pip3 install git+https://github.com/DanielPollithy/pypcd.git
 
+RUN /bin/bash -c "source /opt/ros/noetic/setup.bash"
+
 COPY . /work
 
 WORKDIR /work
