@@ -642,26 +642,10 @@ def write_scene_to_mcap(nusc: NuScenes, nusc_can: NuScenesCanBus, scene, filepat
     can_parsers = [
         [nusc_can.get_messages(scene_name, "ms_imu"), 0, get_imu_msg],
         [nusc_can.get_messages(scene_name, "pose"), 0, get_odom_msg],
-        [
-            nusc_can.get_messages(scene_name, "steeranglefeedback"),
-            0,
-            lambda x: get_basic_can_msg("Steering Angle", x),
-        ],
-        [
-            nusc_can.get_messages(scene_name, "vehicle_monitor"),
-            0,
-            lambda x: get_basic_can_msg("Vehicle Monitor", x),
-        ],
-        [
-            nusc_can.get_messages(scene_name, "zoesensors"),
-            0,
-            lambda x: get_basic_can_msg("Zoe Sensors", x),
-        ],
-        [
-            nusc_can.get_messages(scene_name, "zoe_veh_info"),
-            0,
-            lambda x: get_basic_can_msg("Zoe Vehicle Info", x),
-        ],
+        [nusc_can.get_messages(scene_name, "steeranglefeedback"), 0, lambda x: get_basic_can_msg("Steering Angle", x)],
+        [nusc_can.get_messages(scene_name, "vehicle_monitor"), 0,lambda x: get_basic_can_msg("Vehicle Monitor", x)],
+        [nusc_can.get_messages(scene_name, "zoesensors"), 0, lambda x: get_basic_can_msg("Zoe Sensors", x)],
+        [nusc_can.get_messages(scene_name, "zoe_veh_info"), 0, lambda x: get_basic_can_msg("Zoe Vehicle Info", x)],
     ]
     
     filepath.parent.mkdir(parents=True, exist_ok=True)
