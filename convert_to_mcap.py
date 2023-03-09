@@ -7,7 +7,7 @@ from typing import Dict, Tuple
 
 import numpy as np
 import rospy
-
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from mcap.writer import Writer, CompressionType
 from nuscenes.can_bus.can_bus_api import NuScenesCanBus
 from nuscenes.eval.common.utils import quaternion_yaw
@@ -226,7 +226,16 @@ def get_odom_msg(pose_data):
 
 
 def get_basic_can_msg(name, diag_data):
-    pass    
+    values = []
+    for (key, value) in diag_data.items():
+        if key != "utime":
+            values.append(KeyValue(key=key, value=str(round(value, 4))))
+
+    msg = DiagnosticArray()
+    msg.header.stamp = get_utime(diag_data)
+    msg.status.append(DiagnosticStatus(name=name, level=0, message="OK", values=values))
+
+    return (msg.header.stamp, "/diagnostics", msg)    
  
 
 def scene_bounding_box(nusc, scene, nusc_map, padding=75.0):
